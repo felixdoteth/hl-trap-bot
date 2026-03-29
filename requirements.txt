@@ -1,0 +1,5 @@
+ccxt
+pandas>=2.2
+pandas_ta>=0.4.67b0
+requests>=2.31
+python-dotenv>=1.0
