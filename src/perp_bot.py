@@ -11,26 +11,25 @@ import pandas as pd
 sys.path.insert(0, '/root/btc-ema-polymarket-bot')
 sys.path.insert(0, '/root/corewriter-sdk')
 
-from src.signal_engine import SignalEngine, EngineConfig, Direction, TrapType
+from signal_engine import SignalEngine, EngineConfig, Direction, TrapType
 from corewriter import CoreWriter
 
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
-PRIVATE_KEY  = os.getenv('POLYGON_PRIVATE_KEY')
-RISK_PCT     = float(os.getenv('RISK_PCT', '0.005'))       # 0.5% per trade
+PRIVATE_KEY  = os.getenv('HL_PRIVATE_KEY')
+RISK_PCT     = float(os.getenv('RISK_PCT', '0.05'))       # 0.5% per trade
 SL_ATR_MULT  = float(os.getenv('SL_ATR_MULT', '1.5'))
 TP_ATR_MULT  = float(os.getenv('TP_ATR_MULT', '2.5'))
 DRY_RUN      = os.getenv('DRY_RUN', 'true').lower() != 'false'
-TG_TOKEN     = os.getenv('TELEGRAM_TOKEN', '')
-TG_CHAT      = os.getenv('TELEGRAM_CHAT_ID', '')
+DISCORD_WEBHOOK = os.getenv('DISCORD_WEBHOOK', '')
 DB_PATH      = os.path.expanduser('~/perp_trades.db')
 
 LEVERAGE = int(os.getenv('LEVERAGE', '50'))
 
 ASSETS = {
-    'BTC': {'symbol': 'BTCUSDT', 'asset_idx': 0,  'min_size': 0.001},
-    'ETH': {'symbol': 'ETHUSDT', 'asset_idx': 1,  'min_size': 0.01},
+    'BTC': {'symbol': 'BTCUSDT', 'asset_idx': 0,  'min_size': 0.001, 'leverage': 40},
+    'ETH': {'symbol': 'ETHUSDT', 'asset_idx': 1,  'min_size': 0.01,  'leverage': 25},
     'SOL': {'symbol': 'SOLUSDT', 'asset_idx': 18, 'min_size': 0.1},
 }
 
@@ -38,11 +37,11 @@ ASSETS = {
 engine = SignalEngine(EngineConfig())
 cw = CoreWriter(PRIVATE_KEY) if not DRY_RUN and PRIVATE_KEY else None
 
-def tg(msg):
-    if not TG_TOKEN or not TG_CHAT: return
+def notify(msg):
+    if not DISCORD_WEBHOOK: return
     try:
-        requests.post(f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage',
-            json={'chat_id': TG_CHAT, 'text': msg, 'parse_mode': 'HTML'}, timeout=3)
+        requests.post(DISCORD_WEBHOOK,
+            json={'content': msg}, timeout=3)
     except: pass
 
 def init_db():
@@ -74,7 +73,7 @@ def get_perp_price(asset_idx):
     return float(r.json()[1][asset_idx].get('midPx', 0))
 
 def get_account_value():
-    if not cw: return 1000.0  # dry run default
+    if not cw: return 100.0  # dry run default
     bal = cw.get_perp_balance()
     return float(bal.get('account_value', 1000))
 
@@ -125,9 +124,15 @@ def monitor_position(asset, tid, direction, entry, sl, tp, asset_idx):
                     c.commit(); c.close()
 
                     icon = '💰' if outcome == 'WIN' else '❌'
-                    msg = f'{icon} <b>{asset} {direction}</b>\nEntry: {entry:.2f} → Exit: {cur:.2f}\nP&L: <b>${pnl:+.2f}</b> | {outcome}'
+                    msg = f'{icon} **{asset} {direction}**\nEntry: {entry:.2f} → Exit: {cur:.2f}\nP&L: **${pnl:+.2f}** | {outcome}'
                     print(f"  [{asset}] {outcome} @ {cur:.2f} P&L: ${pnl:+.2f}")
-                    tg(msg)
+                    c2 = sqlite3.connect(DB_PATH)
+                    total_pnl = c2.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE ts_close IS NOT NULL").fetchone()[0]
+                    wins = c2.execute("SELECT COUNT(*) FROM trades WHERE outcome='WIN'").fetchone()[0]
+                    losses = c2.execute("SELECT COUNT(*) FROM trades WHERE outcome='LOSS'").fetchone()[0]
+                    c2.close()
+                    msg += f'\nSession P&L: **${total_pnl:+.2f}** | W:{wins} L:{losses}'
+                    notify(msg)
                     active_positions.pop(asset, None)
                     break
 
@@ -188,7 +193,7 @@ def run():
     reconcile_open_trades()
     print(f"🚀 Price Action Trap Bot | DRY_RUN={DRY_RUN}")
     print(f"   Assets: {list(ASSETS.keys())} | Risk: {RISK_PCT*100}% | SL: {SL_ATR_MULT}x ATR | TP: {TP_ATR_MULT}x ATR")
-    tg(f'🚀 <b>Trap Bot Started</b>\nDRY_RUN: {DRY_RUN}\nRisk: {RISK_PCT*100}% | SL: {SL_ATR_MULT}xATR | TP: {TP_ATR_MULT}xATR')
+    notify(f'🚀 **Trap Bot Started**\nDRY_RUN: {DRY_RUN}\nRisk: {RISK_PCT*100}% | SL: {SL_ATR_MULT}xATR | TP: {TP_ATR_MULT}xATR')
 
     while True:
         try:
@@ -242,14 +247,18 @@ def run():
                     print(f"   Entry: {entry:.2f} | SL: {sl:.2f} | TP: {tp:.2f}")
                     print(f"   Size: {size} | Conf: {result.confidence:.2f} | {trap}")
 
+                    # Set leverage per asset
+                    if not DRY_RUN and cw:
+                        cw.set_leverage(cfg['asset_idx'], cfg['leverage'])
+
                     # Place order
                     if not DRY_RUN and cw:
                         tx, status = cw.place_perp_order(
                             asset=cfg['asset_idx'],
                             is_buy=(result.direction == Direction.LONG),
-                            limit_price=entry * (1.001 if result.direction == Direction.LONG else 0.999),
+                            limit_price=entry,
                             size=size,
-                            tif=3
+                            tif=1
                         )
                         print(f"   TX: {tx} status={status}")
                     else:
@@ -270,7 +279,7 @@ def run():
 
                     active_positions[asset] = {'size': size, 'entry': entry, 'direction': result.direction.value}
 
-                    tg(f'🎯 <b>{asset} {result.direction.value}</b>\nEntry: {entry:.2f} | SL: {sl:.2f} | TP: {tp:.2f}\nConf: {result.confidence:.2f} | {trap}')
+                    notify(f'🎯 **{asset} {result.direction.value}**\nEntry: {entry:.2f} | SL: {sl:.2f} | TP: {tp:.2f}\nConf: {result.confidence:.2f} | {trap}')
 
                     # Start monitor
                     monitor_position(asset, tid, result.direction.value, entry, sl, tp, cfg['asset_idx'])
