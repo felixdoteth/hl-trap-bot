@@ -23,6 +23,8 @@ SL_ATR_MULT  = float(os.getenv('SL_ATR_MULT', '1.5'))
 TP_ATR_MULT  = float(os.getenv('TP_ATR_MULT', '2.5'))
 DRY_RUN      = os.getenv('DRY_RUN', 'true').lower() != 'false'
 DISCORD_WEBHOOK = os.getenv('DISCORD_WEBHOOK', '')
+TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN', '')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 DB_PATH      = os.path.expanduser('~/perp_trades.db')
 
 LEVERAGE = int(os.getenv('LEVERAGE', '50'))
@@ -30,7 +32,6 @@ LEVERAGE = int(os.getenv('LEVERAGE', '50'))
 ASSETS = {
     'BTC': {'symbol': 'BTCUSDT', 'asset_idx': 0,  'min_size': 0.001, 'leverage': 40},
     'ETH': {'symbol': 'ETHUSDT', 'asset_idx': 1,  'min_size': 0.01,  'leverage': 25},
-    'SOL': {'symbol': 'SOLUSDT', 'asset_idx': 18, 'min_size': 0.1},
 }
 
 # ── Init ──────────────────────────────────────────────────────────────────────
@@ -38,11 +39,18 @@ engine = SignalEngine(EngineConfig())
 cw = CoreWriter(PRIVATE_KEY) if not DRY_RUN and PRIVATE_KEY else None
 
 def notify(msg):
-    if not DISCORD_WEBHOOK: return
-    try:
-        requests.post(DISCORD_WEBHOOK,
-            json={'content': msg}, timeout=3)
-    except: pass
+    if DISCORD_WEBHOOK:
+        try:
+            requests.post(DISCORD_WEBHOOK,
+                json={'content': msg}, timeout=3)
+        except: pass
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            requests.post(
+                f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
+                json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'Markdown'},
+                timeout=3)
+        except: pass
 
 def init_db():
     c = sqlite3.connect(DB_PATH)
@@ -114,7 +122,7 @@ def monitor_position(asset, tid, direction, entry, sl, tp, asset_idx):
                             limit_price=cur * (0.999 if direction == 'LONG' else 1.001),
                             size=size,
                             reduce_only=True,
-                            tif=3
+                            tif=2
                         )
 
                     # Update DB
@@ -209,8 +217,16 @@ def run():
                 # Get current perp price for market_price (normalize 0-1 for engine)
                 perp_px = get_perp_price(cfg['asset_idx'])
 
-                # Run signal engine — use 0.5 as neutral market_price for now
+                # Run signal engine
                 result = engine.should_trade(df, market_price=0.5)
+
+                # Direction-aware edge fix for perps
+                if result.should_trade:
+                    p_fair = result.p_fair
+                    perp_edge = p_fair - 0.5 if result.direction == Direction.LONG else 0.5 - p_fair
+                    if perp_edge <= engine.cfg.edge_min:
+                        print(f"  [{asset}] Edge filtered SHORT ({perp_edge:.4f})")
+                        continue
 
                 if result.should_trade:
                     # Get ATR for sizing
@@ -258,7 +274,7 @@ def run():
                             is_buy=(result.direction == Direction.LONG),
                             limit_price=entry,
                             size=size,
-                            tif=1
+                            tif=2
                         )
                         print(f"   TX: {tx} status={status}")
                     else:
