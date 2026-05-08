@@ -156,6 +156,27 @@ class CoreWriter:
         })
         return int.from_bytes(result[:8], 'big') if result else 0
 
+    def set_leverage(self, asset: int, leverage: int, is_cross: bool = False) -> dict:
+        """Set leverage for a perp asset via Hyperliquid L1 API."""
+        import json, time
+        from eth_account.messages import encode_defunct
+        action = {
+            "type": "updateLeverage",
+            "asset": asset,
+            "isCross": is_cross,
+            "leverage": leverage
+        }
+        nonce = int(time.time() * 1000)
+        msg = json.dumps({"action": action, "nonce": nonce}, separators=(',', ':'))
+        signed = self.account.sign_message(encode_defunct(text=msg))
+        payload = {
+            "action": action,
+            "nonce": nonce,
+            "signature": {"r": hex(signed.r), "s": hex(signed.s), "v": signed.v}
+        }
+        r = requests.post('https://api.hyperliquid.xyz/exchange', json=payload, timeout=5)
+        return r.json()
+
 
 # ── Quick demo ──────────────────────────────────────────────────────────────
 if __name__ == '__main__':
@@ -184,24 +205,3 @@ if __name__ == '__main__':
     print('Testing cancel_all (safe, no-op if no orders)...')
     tx, status = cw.cancel_all()
     print(f'  tx={tx} status={status}')
-
-    def set_leverage(self, asset: int, leverage: int, is_cross: bool = False) -> dict:
-        """Set leverage for a perp asset via Hyperliquid L1 API."""
-        import json, time
-        from eth_account.messages import encode_defunct
-        action = {
-            "type": "updateLeverage",
-            "asset": asset,
-            "isCross": is_cross,
-            "leverage": leverage
-        }
-        nonce = int(time.time() * 1000)
-        msg = json.dumps({"action": action, "nonce": nonce}, separators=(',', ':'))
-        signed = self.account.sign_message(encode_defunct(text=msg))
-        payload = {
-            "action": action,
-            "nonce": nonce,
-            "signature": {"r": hex(signed.r), "s": hex(signed.s), "v": signed.v}
-        }
-        r = requests.post('https://api.hyperliquid.xyz/exchange', json=payload, timeout=5)
-        return r.json()

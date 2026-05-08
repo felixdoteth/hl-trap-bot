@@ -4,7 +4,7 @@ Price Action Trap Bot — Hyperliquid Perps via CoreWriter
 Uses signal_engine.py for trap detection + CoreWriter for execution
 """
 import os, time, sys, requests, sqlite3, threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, timedelta
 from dotenv import load_dotenv
 import pandas as pd
 
@@ -96,6 +96,13 @@ def calc_size(asset_idx, entry_price, atr):
 
 active_positions = {}
 
+# ── Trap cooldown state ───────────────────────────────────────────────────────
+t4_consecutive_losses = 0
+t4_cooldown_until     = None   # datetime or None
+
+t2_consecutive_losses = 0
+t2_cooldown_until     = None   # datetime or None
+
 def monitor_position(asset, tid, direction, entry, sl, tp, asset_idx):
     def _run():
         print(f"  [{asset}] Monitoring {direction} @ {entry:.2f} SL={sl:.2f} TP={tp:.2f}")
@@ -141,6 +148,34 @@ def monitor_position(asset, tid, direction, entry, sl, tp, asset_idx):
                     c2.close()
                     msg += f'\nSession P&L: **${total_pnl:+.2f}** | W:{wins} L:{losses}'
                     notify(msg)
+                    # ── Adaptive cooldown tracking ────────────────────────
+                    global t4_consecutive_losses, t4_cooldown_until
+                    global t2_consecutive_losses, t2_cooldown_until
+                    trap_type = active_positions.get(asset, {}).get('trap_type', '')
+                    now_dt = datetime.now(timezone.utc)
+
+                    if 'T4_OUTSIDE_DOUBLE_TRAP' in trap_type:
+                        if outcome == 'LOSS':
+                            t4_consecutive_losses += 1
+                            if t4_consecutive_losses >= 2:
+                                t4_cooldown_until = now_dt + timedelta(minutes=90)
+                                print(f"  [T4 COOLDOWN] {t4_consecutive_losses} consecutive losses — cooling down until {t4_cooldown_until.strftime('%H:%M:%S')} UTC")
+                                notify(f'⏸️ **T4 Cooldown activated** ({t4_consecutive_losses} losses) — 90 min pause')
+                        elif outcome == 'WIN':
+                            t4_consecutive_losses = 0
+                            t4_cooldown_until = None
+
+                    elif 'T2_STOP_SWEEP' in trap_type:
+                        if outcome == 'LOSS':
+                            t2_consecutive_losses += 1
+                            if t2_consecutive_losses >= 3:
+                                t2_cooldown_until = now_dt + timedelta(minutes=45)
+                                print(f"  [T2 COOLDOWN] {t2_consecutive_losses} consecutive losses — cooling down until {t2_cooldown_until.strftime('%H:%M:%S')} UTC")
+                                notify(f'⏸️ **T2 Cooldown activated** ({t2_consecutive_losses} losses) — 45 min pause')
+                        elif outcome == 'WIN':
+                            t2_consecutive_losses = 0
+                            t2_cooldown_until = None
+
                     active_positions.pop(asset, None)
                     break
 
@@ -164,7 +199,7 @@ def reconcile_open_trades():
         c.close()
         return
     print(f"[Reconcile] Found {len(rows)} open trades from previous session")
-    from datetime import datetime, timezone
+    from datetime import datetime, timezone, timedelta, timedelta
     for tid, asset, direction, entry, sl, tp, size in rows:
         try:
             cfg = next((v for k,v in ASSETS.items() if k==asset), None)
@@ -197,6 +232,8 @@ def reconcile_open_trades():
     c.close()
 
 def run():
+    global t4_consecutive_losses, t4_cooldown_until
+    global t2_consecutive_losses, t2_cooldown_until
     init_db()
     reconcile_open_trades()
     print(f"🚀 Price Action Trap Bot | DRY_RUN={DRY_RUN}")
@@ -234,9 +271,53 @@ def run():
                     atr = float(df_prep['atr14'].iloc[-1])
                     entry = perp_px
 
-                    # SL/TP based on ATR
                     # Skip T1_FAILED_BREAKOUT — negative expectancy
                     trap_str = result.reasoning[2] if len(result.reasoning) > 2 else ''
+
+                    # Toxic T4 dead-zone suppression (0.77–0.81 = poor expectancy from DB)
+                    t4_conf = result.confidence
+                    if (
+                        'T4_OUTSIDE_DOUBLE_TRAP' in trap_str
+                        and 0.77 <= t4_conf <= 0.81
+                    ):
+                        print(f"  [{asset}] Skip toxic T4 confidence zone ({t4_conf:.2f})")
+                        continue
+
+                    # Adaptive cooldown — block only, counters managed in monitor
+                    now_dt = datetime.now(timezone.utc)
+                    if 'T4_OUTSIDE_DOUBLE_TRAP' in trap_str and t4_cooldown_until and now_dt < t4_cooldown_until:
+                        print(f"  [{asset}] T4 cooldown active until {t4_cooldown_until.strftime('%H:%M:%S')} UTC — skipping")
+                        continue
+                    if 'T2_STOP_SWEEP' in trap_str and t2_cooldown_until and now_dt < t2_cooldown_until:
+                        print(f"  [{asset}] T2 cooldown active until {t2_cooldown_until.strftime('%H:%M:%S')} UTC — skipping")
+                        continue
+
+                    # Adaptive cooldown — block only, counters managed in monitor
+                    now_dt = datetime.now(timezone.utc)
+                    if 'T4_OUTSIDE_DOUBLE_TRAP' in trap_str and t4_cooldown_until and now_dt < t4_cooldown_until:
+                        print(f"  [{asset}] T4 cooldown active until {t4_cooldown_until.strftime('%H:%M:%S')} UTC — skipping")
+                        continue
+                    if 'T2_STOP_SWEEP' in trap_str and t2_cooldown_until and now_dt < t2_cooldown_until:
+                        print(f"  [{asset}] T2 cooldown active until {t2_cooldown_until.strftime('%H:%M:%S')} UTC — skipping")
+                        continue
+
+                    # Adaptive cooldown checks
+                    now_dt = datetime.now(timezone.utc)
+                    if 'T4_OUTSIDE_DOUBLE_TRAP' in trap_str and t4_cooldown_until:
+                        if now_dt < t4_cooldown_until:
+                            print(f"  [{asset}] T4 cooldown active until {t4_cooldown_until.strftime('%H:%M:%S')} UTC — skipping")
+                            continue
+                        else:
+                            t4_consecutive_losses = 0
+                            t4_cooldown_until = None
+                    if 'T2_STOP_SWEEP' in trap_str and t2_cooldown_until:
+                        if now_dt < t2_cooldown_until:
+                            print(f"  [{asset}] T2 cooldown active until {t2_cooldown_until.strftime('%H:%M:%S')} UTC — skipping")
+                            continue
+                        else:
+                            t2_consecutive_losses = 0
+                            t2_cooldown_until = None
+
                     if 'T1_FAILED_BREAKOUT' in trap_str:
                         print(f"  [{asset}] Skip T1_FAILED_BREAKOUT")
                         continue
@@ -293,7 +374,7 @@ def run():
                     tid = c.execute('SELECT last_insert_rowid()').fetchone()[0]
                     c.close()
 
-                    active_positions[asset] = {'size': size, 'entry': entry, 'direction': result.direction.value}
+                    active_positions[asset] = {'size': size, 'entry': entry, 'direction': result.direction.value, 'trap_type': trap_str}
 
                     notify(f'🎯 **{asset} {result.direction.value}**\nEntry: {entry:.2f} | SL: {sl:.2f} | TP: {tp:.2f}\nConf: {result.confidence:.2f} | {trap}')
 
