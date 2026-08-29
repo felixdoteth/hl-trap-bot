@@ -146,6 +146,10 @@ class EngineConfig:
     # scoring
     min_total_score: float = 0.62
 
+    # edge
+    edge_min: float = 0.03
+    use_binary_edge: bool = True   # False = continuous markets (Forex/CFD)
+
 
 # =========================
 # Utility helpers
@@ -832,25 +836,35 @@ class SignalEngine:
 
     def edge_filter(self, signal_strength: float, direction: Direction, market_price: float) -> EdgeResult:
         """
-        Binary-specific edge model.
+        Binary mode (prediction markets):
+           LONG  -> p_fair - p_market
+        SHORT -> (1 - p_fair) - p_market
 
-        p_fair mapping:
-          p_fair = 0.5 + alpha*(signal_strength-0.5)
-          alpha>1 increases separation but clips to [0.02,0.98].
-
-        edge:
-          LONG  -> p_fair - p_market
-          SHORT -> (1-p_fair) - p_market
-
-        NOTE:
-          Ensure market_price corresponds to the traded contract stream.
-          If you pass YES-on-UP market for LONG and YES-on-DOWN market for SHORT,
-          adapt caller or this function accordingly.
+        Continuous mode (Forex/CFD):
+          Both directions use the same edge proxy based on signal strength.
+          market_price is ignored.
         """
-        p_market = float(np.clip(market_price, 0.001, 0.999))
-
         alpha = 1.35
         p_fair = float(np.clip(0.5 + alpha * (signal_strength - 0.5), 0.02, 0.98))
+
+        if not self.cfg.use_binary_edge:
+            # Continuous market: treat both directions the same
+            # Edge is just how far signal_strength is above neutral
+            edge = p_fair - 0.5
+            p_market = 0.5          # neutral placeholder
+            passed = edge > self.cfg.edge_min
+            reason = f"continuous edge={edge:.4f} vs min={self.cfg.edge_min:.4f}"
+            return EdgeResult(
+                passed=passed,
+                p_fair=p_fair,
+                p_market=p_market,
+                edge=float(edge),
+                edge_min=self.cfg.edge_min,
+                reason=reason,
+            )
+
+        # Original binary logic
+        p_market = float(np.clip(market_price, 0.001, 0.999))
 
         if direction == Direction.LONG:
             edge = p_fair - p_market
